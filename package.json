@@ -1,0 +1,44 @@
+{
+  "name": "assistant",
+  "version": "0.0.1",
+  "description": "MobX-based in-app LLM assistant: an agent loop with tools, behaviors and stored sessions",
+  "private": true,
+  "author": "Joost Lubach <joostlubach@gmail.com>",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "npm run clean && npm run build:tsc",
+    "build:tsc": "npm run build:tsc:esm && npm run build:tsc:cjs",
+    "build:tsc:esm": "tsc -p tsconfig.prod.json --module es2022 --outDir dist/esm --declarationDir dist/types",
+    "build:tsc:cjs": "tsc -p tsconfig.prod.json --module commonjs --outDir dist/cjs --declaration false --declarationMap false",
+    "clean": "rimraf dist",
+    "lint": "eslint",
+    "check": "tsc -p . --noEmit",
+    "test": "vitest"
+  },
+  "dependencies": {
+    "lodash": "^4.17.21",
+    "logger": "workspace:^",
+    "react-util": "workspace:^",
+    "ytil": "workspace:^"
+  },
+  "peerDependencies": {
+    "mobx": ">=6.15",
+    "react-router-dom": ">=7",
+    "zod": ">=4"
+  },
+  "devDependencies": {
+    "@types/lodash": "^4.17.20",
+    "@typescript-eslint/eslint-plugin": "^8.61.0",
+    "@typescript-eslint/parser": "^8.46.2",
+    "eslint": "^9.38.0",
+    "eslint-plugin-unused-imports": "^4.3.0",
+    "globals": "^16.4.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.3",
+    "vitest": "^4.0.18",
+    "yaml": "^2.8.2"
+  }
+}

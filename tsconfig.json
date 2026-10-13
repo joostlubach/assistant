@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "moduleResolution": "node",
+    "isolatedModules": true,
+
+    "rootDir": "src",
+    "outDir": "dist",
+
+    "declaration": true,
+    "sourceMap": true,
+    "declarationMap": true,
+    
+    "strict": true,
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "useDefineForClassFields": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+  },
+  "include": [
+    "src"
+  ]
+}
