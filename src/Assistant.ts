@@ -23,10 +23,10 @@ import { LLMStreamError } from './llm/readLLMStream'
 import { LLMContentBlock, LLMTextBlock, LLMToolUseBlock } from './llm/types'
 import {
   AssistantSessionContent,
-  AssistantSessionDocument,
   AssistantSessionID,
   AssistantSessions,
   AssistantSessionState,
+  Session,
 } from './sessions'
 import { AskUserTool } from './tools/AskUserTool'
 import {
@@ -125,9 +125,13 @@ export class Assistant extends Disposable {
     if (this.started) { return }
     this.started = true
 
-    const latest = await this.host.sessions.latest()
-    if (latest != null && this.currentSessionId == null) {
-      await this.openSession(latest)
+    const result = await this.host.sessions.latest()
+    if (result.status !== 'ok') {
+      this.logger.warning(`Unable to find the latest session: ${result.message}`)
+      return
+    }
+    if (result.data != null && this.currentSessionId == null) {
+      await this.openSession(result.data)
     }
   }
 
@@ -274,25 +278,16 @@ export class Assistant extends Disposable {
   // #region Sessions
 
   @observable.ref
-  private accessor _currentSessionDocument: AssistantSessionDocument | null = null
+  private accessor _currentSessionId: AssistantSessionID | null = null
+  public get currentSessionId() { return this._currentSessionId }
 
-  @computed
-  public get currentSessionId() {
-    if (this._currentSessionDocument == null) { return null }
-    return this._currentSessionDocument.id
-  }
+  @observable.ref
+  private accessor _currentSession: Session | null = null
+  public get currentSession() { return this._currentSession }
 
-  @computed
-  public get loadingCurrentSession() {
-    if (this._currentSessionDocument == null) { return false }
-    return this._currentSessionDocument.fetching
-  }
-
-  @computed
-  public get currentSession() {
-    if (this._currentSessionDocument == null) { return null }
-    return this._currentSessionDocument.data
-  }
+  @observable
+  private accessor _loadingCurrentSession: boolean = false
+  public get loadingCurrentSession() { return this._loadingCurrentSession }
 
   @computed
   public get isCurrentSessionArchived() {
@@ -305,7 +300,8 @@ export class Assistant extends Disposable {
   @action
   public newSession() {
     this.reset()
-    this._currentSessionDocument = null
+    this._currentSessionId = null
+    this._currentSession = null
   }
 
   public async openSession(id: AssistantSessionID) {
@@ -313,22 +309,28 @@ export class Assistant extends Disposable {
     if (id === this.currentSessionId) { return }
 
     this.reset()
-    
+
     const conversation = this.conversation
-    const document = this.host.sessions.document(id)
-    
     runInAction(() => {
-      this._currentSessionDocument = document
+      this._currentSessionId = id
+      this._currentSession = null
+      this._loadingCurrentSession = true
     })
-    await document.fetch()
-    
-    if (conversation === this.conversation) {
-      this.restore(document.data)
+
+    const result = await this.host.sessions.load(id)
+    if (conversation !== this.conversation) { return }
+
+    runInAction(() => { this._loadingCurrentSession = false })
+    if (result.status !== 'ok') {
+      this.logger.warning(`Unable to load session ${id}: ${result.message}`)
+      return
     }
+    this.restore(result.data)
   }
 
   @action
-  private restore(session: AssistantSessionDocument['data']) {
+  private restore(session: Session | null) {
+    this._currentSession = session
     this.loop.load(toJS(session?.messages ?? []))
     this._entries = session?.entries ?? []
     this.restoreState(toJS(session?.state ?? {}))
@@ -340,13 +342,22 @@ export class Assistant extends Disposable {
       await this.savingCurrentSession
     }
 
-    const document = this.host.sessions.document(id)
-    await document.update({archived: true})
+    await this.setArchived(id, true)
   }
 
   public async unarchiveSession(id: AssistantSessionID) {
-    const document = this.host.sessions.document(id)
-    await document.update({archived: false})
+    await this.setArchived(id, false)
+  }
+
+  private async setArchived(id: AssistantSessionID, archived: boolean) {
+    const result = await this.host.sessions.save(id, {archived})
+    if (result.status !== 'ok') {
+      this.logger.warning(`Unable to ${archived ? 'archive' : 'unarchive'} session ${id}: ${result.message}`)
+      return
+    }
+    if (id === this.currentSessionId && this._currentSession != null) {
+      runInAction(() => { this._currentSession = {...this._currentSession!, archived} })
+    }
   }
 
   public async removeSession(id: AssistantSessionID) {
@@ -356,8 +367,11 @@ export class Assistant extends Disposable {
       await this.savingCurrentSession
     }
 
-    const document = this.host.sessions.document(id)
-    await document.delete()
+    const result = await this.host.sessions.delete(id)
+    if (result.status !== 'ok') {
+      this.logger.warning(`Unable to delete session ${id}: ${result.message}`)
+      return
+    }
 
     if (current) {
       this.newSession()
@@ -373,6 +387,7 @@ export class Assistant extends Disposable {
   private reset() {
     this.stop()
     this.conversation++
+    this._loadingCurrentSession = false
     this.loop.reset()
     this.lastContext = null
     this._behaviorsAtLastSend = new Set()
@@ -436,26 +451,24 @@ export class Assistant extends Disposable {
   private async saveLoop() {
     do {
       this.saveAgain = false
-      try {
-        await this.saveNow()
-      } catch (error) {
-        const message = errorMessage(error)
-        this.logger.error(message, error)
-      }
+      await this.saveNow()
     } while (this.saveAgain)
   }
 
   private async saveNow() {
     if (this._entries.length === 0) { return }
 
-    if (this._currentSessionDocument == null) {
+    if (this._currentSessionId == null) {
       await this.createSession()
     } else {
-      await this._currentSessionDocument.update({
+      const result = await this.host.sessions.save(this._currentSessionId, {
         messages: this.loop.messages,
         entries:  storableEntries(this._entries),
         ...this.stateContent(),
       })
+      if (result.status !== 'ok') {
+        this.logger.warning(`Unable to save session: ${result.message}`)
+      }
     }
   }
 
@@ -463,8 +476,9 @@ export class Assistant extends Disposable {
     const conversation = this.conversation
     const userEntries = this._entries.filter(it => it.type === 'user')
 
-    const id = await this.host.sessions.create({
-      title:    userEntries.length > 0 ? truncate(userEntries[0].text, {length: 100}) : null,
+    const title = userEntries.length > 0 ? truncate(userEntries[0].text, {length: 100}) : null
+    const result = await this.host.sessions.create({
+      title,
       messages: this.loop.messages,
       entries:  storableEntries(this._entries),
       ...this.stateContent(),
@@ -473,13 +487,15 @@ export class Assistant extends Disposable {
       // A new conversation was started in the mean time.
       return
     }
-    if (id == null) {
-      this.logger.warning(`Unable to create session`)
+    if (result.status !== 'ok') {
+      this.logger.warning(`Unable to create session: ${result.message}`)
       return
     }
 
+    const id = result.data
     runInAction(() => {
-      this._currentSessionDocument = this.host.sessions.document(id)
+      this._currentSessionId = id
+      this._currentSession = {id, title, archived: false}
     })
   }
 

@@ -1,4 +1,3 @@
-import { makeAutoObservable, runInAction } from 'mobx'
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { Assistant, AssistantHost } from '../Assistant'
@@ -7,12 +6,12 @@ import { AssistantAttachmentReader } from '../attachments/AssistantAttachmentRea
 import { AssistantAttachment } from '../attachments/AttachmentsContainer'
 import { AssistantTarget, AssistantTool } from '../AssistantTool'
 import { LLMContentBlock, LLMRequest } from '../llm/types'
+import { Result } from '../Result'
 import {
-  AssistantSessionData,
   AssistantSessionContent,
-  AssistantSessionDocument,
   AssistantSessionID,
   AssistantSessions,
+  Session,
 } from '../sessions'
 import { AssistantUserEntry } from '../types'
 import { deferred, eventStream, responseEvents, text, toolUse } from './helpers'
@@ -43,13 +42,13 @@ describe('Assistant', () => {
     it('cannot send while a session is loading', async () => {
       const {assistant, sessions} = setup([])
       sessions.store(session(1, 'Earlier'))
-      const fetch = sessions.holdFetch(1)
+      const load = sessions.holdLoad(1)
 
       const opening = assistant.openSession(1)
       expect(assistant.loadingCurrentSession).toBe(true)
       expect(assistant.canSend).toBe(false)
 
-      fetch.resolve()
+      load.resolve()
       await opening
 
       expect(assistant.canSend).toBe(true)
@@ -60,7 +59,7 @@ describe('Assistant', () => {
       const {assistant, sessions} = setup([])
       sessions.store(session(1, 'First'))
       sessions.store(session(2, 'Second'))
-      const first = sessions.holdFetch(1)
+      const first = sessions.holdLoad(1)
 
       const openingFirst = assistant.openSession(1)
       await assistant.openSession(2)
@@ -455,7 +454,7 @@ function statefulBehavior(name: string) {
   }
 }
 
-function session(id: number, title: string): AssistantSessionData {
+function session(id: number, title: string): Session {
   return {
     id:       id,
     title:    title,
@@ -489,32 +488,41 @@ const echoSchema = z.object({value: z.string()})
 
 class FakeSessions implements AssistantSessions {
 
-  public readonly stored = new Map<AssistantSessionID, AssistantSessionData>()
+  public readonly stored = new Map<AssistantSessionID, Session>()
   public readonly created: AssistantSessionContent[] = []
 
-  private readonly documents = new Map<AssistantSessionID, FakeSessionDocument>()
-  private readonly heldFetches = new Map<AssistantSessionID, Promise<void>>()
+  private readonly heldLoads = new Map<AssistantSessionID, Promise<void>>()
   private nextID = 1
 
-  public store(session: AssistantSessionData) {
+  public store(session: Session) {
     this.stored.set(session.id, structuredClone(session))
     this.nextID = Math.max(this.nextID, Number(session.id) + 1)
   }
 
-  /** Keeps the next fetch of a session pending until it is resolved. */
-  public holdFetch(id: AssistantSessionID) {
-    const fetch = deferred()
-    this.heldFetches.set(id, fetch.promise)
-    return fetch
+  /** Keeps the next load of a session pending until it is resolved. */
+  public holdLoad(id: AssistantSessionID) {
+    const load = deferred()
+    this.heldLoads.set(id, load.promise)
+    return load
   }
 
-  public document(id: AssistantSessionID) {
-    let document = this.documents.get(id)
-    if (document == null) {
-      document = new FakeSessionDocument(this, id)
-      this.documents.set(id, document)
-    }
-    return document
+  public async latest() {
+    const active = [...this.stored.values()].filter(it => !it.archived)
+    return Result.ok(active[active.length - 1]?.id ?? null)
+  }
+
+  public async list(skip: number, take: number) {
+    const all = [...this.stored.values()].reverse()
+    return Result.ok(all.slice(skip, skip + take).map(({id, title, archived}) => ({id, title, archived})))
+  }
+
+  public async load(id: AssistantSessionID) {
+    const held = this.heldLoads.get(id)
+    this.heldLoads.delete(id)
+    await held
+
+    const stored = this.stored.get(id)
+    return Result.ok(stored == null ? null : structuredClone(stored))
   }
 
   public async create(content: AssistantSessionContent) {
@@ -522,58 +530,19 @@ class FakeSessions implements AssistantSessions {
 
     const id = this.nextID++
     this.stored.set(id, {id, title: content.title ?? null, archived: false, ...structuredClone(content)})
-    return id
+    return Result.ok(id)
   }
 
-  public async latest() {
-    const active = [...this.stored.values()].filter(it => !it.archived)
-    return active[active.length - 1]?.id ?? null
+  public async save(id: AssistantSessionID, content: Partial<AssistantSessionContent & {archived: boolean}>) {
+    const stored = this.stored.get(id)
+    if (stored == null) { return Result.error(`Session ${id} not found`) }
+    this.stored.set(id, {...stored, ...structuredClone(content)})
+    return Result.ok()
   }
 
-  public async waitForFetch(id: AssistantSessionID) {
-    const held = this.heldFetches.get(id)
-    this.heldFetches.delete(id)
-    await held
-  }
-
-}
-
-class FakeSessionDocument implements AssistantSessionDocument {
-
-  constructor(
-    private readonly sessions: FakeSessions,
-    public readonly id: AssistantSessionID,
-  ) {
-    makeAutoObservable<this, 'sessions'>(this, {sessions: false, id: false})
-  }
-
-  public data: AssistantSessionData | null = null
-  public fetching: boolean = false
-
-  public async fetch() {
-    this.fetching = true
-    await this.sessions.waitForFetch(this.id)
-
-    runInAction(() => {
-      const stored = this.sessions.stored.get(this.id)
-      this.data = stored == null ? null : structuredClone(stored)
-      this.fetching = false
-    })
-  }
-
-  public async update(data: Partial<AssistantSessionContent & {archived: boolean}>) {
-    const stored = this.sessions.stored.get(this.id)
-    if (stored == null) { return }
-
-    const updated = {...stored, ...structuredClone(data)}
-    this.sessions.stored.set(this.id, updated)
-    runInAction(() => {
-      this.data = {...updated}
-    })
-  }
-
-  public async delete() {
-    this.sessions.stored.delete(this.id)
+  public async delete(id: AssistantSessionID) {
+    this.stored.delete(id)
+    return Result.ok()
   }
 
 }
