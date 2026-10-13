@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { Assistant, AssistantHost } from '../Assistant'
 import { AssistantBehavior } from '../AssistantBehavior'
+import { AssistantAttachmentReader } from '../attachments/AssistantAttachmentReader'
+import { AssistantAttachment } from '../attachments/AttachmentsContainer'
 import { AssistantTarget, AssistantTool } from '../AssistantTool'
 import { LLMContentBlock, LLMRequest } from '../llm/types'
 import {
@@ -12,6 +14,7 @@ import {
   AssistantSessionID,
   AssistantSessions,
 } from '../sessions'
+import { AssistantUserEntry } from '../types'
 import { deferred, eventStream, responseEvents, text, toolUse } from './helpers'
 
 describe('Assistant', () => {
@@ -161,6 +164,208 @@ describe('Assistant', () => {
 
   })
 
+  describe('attachments', () => {
+
+    it('cannot send the input until its attachments have been read', async () => {
+      const read = deferred()
+      const reader: AssistantAttachmentReader<'image'> = {
+        kind:   'image',
+        accept: {'image/png': ['.png']},
+        read:   async () => {
+          await read.promise
+          return {data: null, preview: new Blob(['preview'])}
+        },
+      }
+      const {assistant} = setup([[text('Nice')]], [], {attachmentReaders: [reader]})
+      assistant.attachments.attach([new File(['logo'], 'logo.png', {type: 'image/png'})])
+
+      expect(assistant.canSendCurrent).toBe(false)
+
+      read.resolve()
+      await settled(assistant)
+      expect(assistant.canSendCurrent).toBe(true)
+    })
+
+    it('shows the previews of what is sent until it has been uploaded, and then refers to the uploads', async () => {
+      const upload = deferred<string>()
+      const attachmentBlocks = vi.fn(async () => [text('Attached')])
+      const reader: AssistantAttachmentReader<'image'> = {
+        kind:   'image',
+        accept: {'image/vnd.adobe.photoshop': ['.psd']},
+        read:   async () => ({data: null, preview: new Blob(['flattened'])}),
+      }
+      const {assistant, requests} = setup([[text('Nice')]], [], {
+        attachmentReaders: [reader],
+        uploadAttachment:  () => upload.promise,
+        attachmentBlocks,
+      })
+      const psd = new File(['layers'], 'design.psd')
+      assistant.attachments.attach([psd])
+      await settled(assistant)
+
+      const sending = assistant.sendCurrent()
+      expect((assistant.entries[0] as AssistantUserEntry).images).toEqual([expect.any(Blob)])
+
+      upload.resolve('media:12')
+      await sending
+
+      expect(assistant.entries[0]).toEqual({type: 'user', text: '', images: ['media:12']})
+      expect(attachmentBlocks).toHaveBeenCalledWith([expect.objectContaining({kind: 'image', file: psd, image: 'media:12'})])
+      expect(requests[0].messages[0].content).toContainEqual(text('Attached'))
+    })
+
+    it('keeps showing the previews of attachments that are only kept in memory, but does not store them', async () => {
+      const attachmentBlocks = vi.fn(async () => [])
+      const {assistant, sessions} = setup([[text('Nice')]], [], {uploadAttachment: async () => null, attachmentBlocks})
+      const logo = readyImage('logo.png')
+
+      await assistant.send('Look', [logo], {images: ['media:3']})
+      await settled(assistant)
+
+      expect((assistant.entries[0] as AssistantUserEntry).images).toEqual([logo.preview, 'media:3'])
+      expect(attachmentBlocks).toHaveBeenCalledWith([expect.objectContaining({file: logo.file, image: null})])
+      expect(sessions.stored.get(1)?.entries?.[0]).toEqual({type: 'user', text: 'Look', images: ['media:3']})
+    })
+
+    it('does not store the previews of attachments that could not be uploaded', async () => {
+      const {assistant, sessions} = setup([], [], {uploadAttachment: async () => { throw new Error('Upload failed') }})
+
+      await assistant.send('Look', [readyImage('logo.png')])
+      await settled(assistant)
+
+      expect(sessions.stored.get(1)?.entries?.[0]).toEqual({type: 'user', text: 'Look', images: []})
+    })
+
+  })
+
+  describe('sending', () => {
+
+    it('sends a note to the LLM that is not shown, and shows extra images', async () => {
+      const {assistant, requests} = setup([[text('Good choice')]])
+
+      await assistant.send('This one', [], {images: ['media:3'], llmNote: 'I chose photo3.'})
+
+      expect(assistant.entries[0]).toEqual({type: 'user', text: 'This one', images: ['media:3']})
+      expect(requests[0].messages[0].content.slice(1)).toEqual([text('This one'), text('I chose photo3.')])
+    })
+
+  })
+
+  describe('failed attachments', () => {
+
+    it('reports attachments that could not be sent, which cannot be retried', async () => {
+      const question = {question: 'Which logo?', options: [{label: 'A'}, {label: 'B'}]}
+      const uploadAttachment = vi.fn(async () => { throw new Error('Upload failed') })
+      const {assistant, requests} = setup([[toolUse('t1', 'ask_user', question)]], [], {uploadAttachment})
+      await assistant.send('Make a logo')
+
+      // After a question, the conversation ends in tool results, which could otherwise be continued.
+      await assistant.send('This one', [readyImage('logo.png')])
+
+      expect(assistant.status).toBe('failed')
+      expect(assistant.entries[assistant.entries.length - 1]).toEqual({type: 'error', code: 'attachments', message: 'Upload failed', retryable: false})
+
+      await assistant.retry()
+      expect(requests).toHaveLength(1)
+    })
+
+    it('reports a failure of a behavior to add to the attachments in the same way', async () => {
+      const failing = behavior('failing', {attachmentBlocks: async () => { throw new Error('Unreadable') }})
+      const {assistant} = setup([], [failing])
+
+      await assistant.send('Look', [readyImage('logo.png')])
+
+      expect(assistant.entries[assistant.entries.length - 1]).toMatchObject({code: 'attachments', message: 'Unreadable', retryable: false})
+    })
+
+  })
+
+  describe('attachment blocks of behaviors', () => {
+
+    it('sends what behaviors add of the attachments after what the host sends', async () => {
+      const general = behavior('general', {attachmentBlocks: async () => [text('General')]})
+      const specific = behavior('specific', {attachmentBlocks: async attachments => [text(`Specific: ${attachments[0].file.name}`)]})
+      const {assistant, requests} = setup([[text('Nice')]], [general], {attachmentBlocks: async () => [text('Host')]})
+      assistant.addBehavior(specific)
+
+      await assistant.send('Look', [readyImage('logo.png')])
+
+      expect(requests[0].messages[0].content.slice(1)).toEqual([text('Host'), text('General'), text('Specific: logo.png'), text('Look')])
+    })
+
+    it('asks nothing of behaviors without attachments', async () => {
+      const attachmentBlocks = vi.fn(async () => [text('Unexpected')])
+      const {assistant, requests} = setup([[text('Hi')]], [behavior('general', {attachmentBlocks})])
+
+      await assistant.send('Hello')
+
+      expect(attachmentBlocks).not.toHaveBeenCalled()
+      expect(requests[0].messages[0].content.slice(1)).toEqual([text('Hello')])
+    })
+
+  })
+
+  describe('behavior state', () => {
+
+    it('stores what behaviors keep with the session, by name, and restores it when the session is opened', async () => {
+      const general = statefulBehavior('general')
+      const specific = statefulBehavior('specific')
+      const {assistant, sessions} = setup([[text('Hi')]], [general])
+      assistant.addBehavior(specific)
+
+      general.value = 'g1'
+      specific.value = 's1'
+      await assistant.send('Hello')
+      await settled(assistant)
+      expect(sessions.stored.get(1)?.state).toEqual({general: 'g1', specific: 's1'})
+
+      assistant.newSession()
+      expect(general.value).toBeNull()
+      expect(specific.value).toBeNull()
+
+      await assistant.openSession(1)
+      expect(general.value).toBe('g1')
+      expect(specific.value).toBe('s1')
+    })
+
+    it('keeps the state of a behavior that was removed, for when it is added again', async () => {
+      const specific = statefulBehavior('specific')
+      const {assistant, sessions} = setup([[text('One')], [text('Two')]])
+      const remove = assistant.addBehavior(specific)
+
+      specific.value = 'kept'
+      remove()
+      await assistant.send('Elsewhere')
+      await settled(assistant)
+      expect(sessions.stored.get(1)?.state).toEqual({specific: 'kept'})
+
+      specific.value = null
+      assistant.addBehavior(specific)
+      expect(specific.value).toBe('kept')
+    })
+
+    it('keeps the stored state of behaviors that are not active', async () => {
+      const {assistant, sessions} = setup([[text('Hi')]])
+      sessions.store({...session(1, 'Earlier'), state: {elsewhere: 'stored'}})
+
+      await assistant.openSession(1)
+      await assistant.send('More')
+      await settled(assistant)
+
+      expect(sessions.stored.get(1)?.state).toEqual({elsewhere: 'stored'})
+    })
+
+    it('stores no state when no behavior keeps any', async () => {
+      const {assistant, sessions} = setup([[text('Hi')]])
+
+      await assistant.send('Hello')
+      await settled(assistant)
+
+      expect(sessions.created[0]).not.toHaveProperty('state')
+    })
+
+  })
+
   describe('behaviors', () => {
 
     it('puts general behaviors first in the prompt, and lets specific ones reveal first', async () => {
@@ -196,7 +401,7 @@ describe('Assistant', () => {
 
 })
 
-function setup(responses: LLMContentBlock[][], generalBehaviors: AssistantBehavior[] = []) {
+function setup(responses: LLMContentBlock[][], generalBehaviors: AssistantBehavior[] = [], overrides: Partial<AssistantHost> = {}) {
   const requests: LLMRequest[] = []
   let index = 0
 
@@ -208,7 +413,9 @@ function setup(responses: LLMContentBlock[][], generalBehaviors: AssistantBehavi
       const content = responses[index++] ?? [text('(no more responses)')]
       return eventStream(responseEvents(content, content.some(it => it.type === 'tool_use') ? 'tool_use' : 'end_turn'))
     }),
+    uploadAttachment: async attachment => `image:${attachment.file.name}`,
     attachmentBlocks: async () => [],
+    ...overrides,
   }
 
   const assistant = new Assistant(host, {prompt: 'System', generalBehaviors})
@@ -231,6 +438,20 @@ function behavior(name: string, overrides: Partial<AssistantBehavior> = {}): Ass
     context:     () => [],
     toolContext: base => base,
     ...overrides,
+  }
+}
+
+function readyImage(name: string): AssistantAttachment {
+  const file = new File(['image'], name, {type: 'image/png'})
+  return {kind: 'image', file, status: 'ready', data: null, preview: file, error: null}
+}
+
+function statefulBehavior(name: string) {
+  return {
+    ...behavior(name),
+    value:        null as unknown,
+    restoreState: function (state: unknown) { this.value = state },
+    saveState:    function () { return this.value },
   }
 }
 

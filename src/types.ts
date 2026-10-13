@@ -13,9 +13,14 @@ export type AssistantEntry =
   | AssistantErrorEntry
 
 export interface AssistantUserEntry {
-  type:   'user'
-  text:   string
-  images: string[]
+  type: 'user'
+  text: string
+
+  /**
+   * The images that were sent: how the app refers to them, like `media:12`, or the images themselves. Those are only
+   * kept in memory, and left out when the session is stored.
+   */
+  images: Array<string | Blob>
 }
 
 export interface AssistantReplyEntry {
@@ -64,9 +69,9 @@ export interface AssistantQuestionEntry extends AssistantQuestion {
 export interface AssistantErrorEntry {
   type:      'error'
   code:      AssistantErrorCode
-  /** What the LLM's provider said went wrong. */
+  /** What the LLM's provider said went wrong, or why the attachments could not be sent. */
   message?:  string
   retryable: boolean
 }
 
-export type AssistantErrorCode = 'unknown' | 'provider' | 'refusal' | 'max_tokens' | 'too_many_turns'
+export type AssistantErrorCode = 'unknown' | 'provider' | 'attachments' | 'refusal' | 'max_tokens' | 'too_many_turns'

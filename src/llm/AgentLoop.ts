@@ -18,6 +18,7 @@ export class AgentLoop {
   constructor(
     private readonly transport: AgentLoopTransport,
     private readonly delegate: AgentLoopDelegate,
+    private readonly options: AgentLoopOptions = {},
   ) {}
 
   private _messages: LLMMessage[] = []
@@ -43,6 +44,7 @@ export class AgentLoop {
   }
 
   public async run(signal: AbortSignal): Promise<AgentLoopEnd> {
+    const maxTurns = this.options.maxTurns ?? defaultMaxTurns
     for (let turn = 0; turn < maxTurns; turn++) {
       const response = await this.request(signal)
       if (response == null || signal.aborted) { return 'aborted' }
@@ -169,7 +171,12 @@ export interface AgentToolRun {
   endTurn: boolean
 }
 
+export interface AgentLoopOptions {
+  /** A safeguard against runaway loops: the most requests it makes in one run. */
+  maxTurns?: number
+}
+
 export type AgentLoopEnd = 'done' | 'aborted' | 'refusal' | 'max_tokens' | 'too_many_turns'
 
-// A safeguard against runaway loops; a large request may take a few dozen tool calls.
-const maxTurns = 40
+// A large request may take a few dozen tool calls.
+const defaultMaxTurns = 40

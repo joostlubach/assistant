@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { AgentLoop, AgentLoopDelegate, AgentToolRun } from '../llm/AgentLoop'
+import { AgentLoop, AgentLoopDelegate, AgentLoopOptions, AgentToolRun } from '../llm/AgentLoop'
 import { LLMContentBlock, LLMRequest, LLMStopReason, LLMToolUseBlock } from '../llm/types'
 import { eventStream, responseEvents, text, toolUse } from './helpers'
 
@@ -84,6 +84,14 @@ describe('AgentLoop', () => {
     expect(requests).toHaveLength(40)
   })
 
+  it('stops a runaway loop at the given number of turns', async () => {
+    const {loop, requests} = setup(Array.from({length: 10}, (_, index) => [toolUse(`${index}`, 'a')]), {}, undefined, {maxTurns: 3})
+    loop.append(userMessage('Go'))
+
+    expect(await loop.run(new AbortController().signal)).toBe('too_many_turns')
+    expect(requests).toHaveLength(3)
+  })
+
   it('reports a refusal, after which the conversation cannot continue', async () => {
     const {loop} = setup([[text('No')]], {}, 'refusal')
     loop.append(userMessage('Go'))
@@ -113,7 +121,7 @@ describe('AgentLoop', () => {
 
 })
 
-function setup(responses: LLMContentBlock[][], delegate: Partial<AgentLoopDelegate> = {}, stopReason?: LLMStopReason) {
+function setup(responses: LLMContentBlock[][], delegate: Partial<AgentLoopDelegate> = {}, stopReason?: LLMStopReason, options: AgentLoopOptions = {}) {
   const requests: LLMRequest[] = []
   let index = 0
 
@@ -132,7 +140,7 @@ function setup(responses: LLMContentBlock[][], delegate: Partial<AgentLoopDelega
       endTurn: false,
     }),
     ...delegate,
-  })
+  }, options)
 
   return {loop, requests, transport}
 }

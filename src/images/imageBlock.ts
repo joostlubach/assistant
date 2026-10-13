@@ -17,7 +17,7 @@ export async function imageBlock(image: Blob): Promise<ImageBlockResult> {
     throw new Error("Could not create a canvas context")
   }
 
-  context.fillStyle = background
+  context.fillStyle = imageBackground
   context.fillRect(0, 0, width, height)
   context.drawImage(bitmap, 0, 0, width, height)
 
@@ -41,4 +41,5 @@ export interface ImageBlockResult {
 }
 
 export const maxImageDimension = 1280
-const background = '#808080'
+/** What transparent parts of an image are shown on. */
+export const imageBackground = '#808080'

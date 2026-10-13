@@ -35,12 +35,17 @@ export interface AssistantSessionData {
   /** Left out of summaries, like in lists. */
   messages?: LLMMessage[]
   entries?:  AssistantEntry[]
+  state?:    AssistantSessionState
 }
 
 export interface AssistantSessionContent {
   title?:   string | null
   messages: LLMMessage[]
   entries:  AssistantEntry[]
+  state?:   AssistantSessionState
 }
+
+/** What the behaviors keep for the conversation, by behavior name. */
+export type AssistantSessionState = Record<string, unknown>
 
 export type AssistantSessionID = string | number

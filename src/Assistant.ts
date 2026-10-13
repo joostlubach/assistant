@@ -2,7 +2,7 @@ import { sortBy, truncate, uniq } from 'lodash'
 import Logger from 'logger'
 import { action, computed, makeObservable, observable, runInAction, toJS } from 'mobx'
 import { Disposable } from 'react-util'
-import { bindMethods, errorMessage } from 'ytil'
+import { bindMethods, errorMessage, objectKeys } from 'ytil'
 import { AssistantBehavior } from './AssistantBehavior'
 import { AssistantConfig } from './AssistantConfig'
 import {
@@ -11,12 +11,23 @@ import {
   AssistantToolContext,
   AssistantToolOutput,
 } from './AssistantTool'
-import { AssistantAttachment, AttachmentsContainer } from './AttachmentsContainer'
-import { thumbnailURL } from './images/thumbnailURL'
+import { AnyAssistantAttachmentReader } from './attachments/AssistantAttachmentReader'
+import {
+  AssistantAttachment,
+  AssistantUploadedAttachment,
+  AttachmentsContainer,
+} from './attachments/AttachmentsContainer'
+import { imageAttachmentReader } from './attachments/imageAttachmentReader'
 import { AgentLoop, AgentLoopTransport, AgentToolRun } from './llm/AgentLoop'
 import { LLMStreamError } from './llm/readLLMStream'
 import { LLMContentBlock, LLMTextBlock, LLMToolUseBlock } from './llm/types'
-import { AssistantSessionDocument, AssistantSessionID, AssistantSessions } from './sessions'
+import {
+  AssistantSessionContent,
+  AssistantSessionDocument,
+  AssistantSessionID,
+  AssistantSessions,
+  AssistantSessionState,
+} from './sessions'
 import { AskUserTool } from './tools/AskUserTool'
 import {
   AssistantEntry,
@@ -24,6 +35,7 @@ import {
   AssistantInteraction,
   AssistantReplyEntry,
   AssistantThinkingEntry,
+  AssistantUserEntry,
 } from './types'
 
 export class Assistant extends Disposable {
@@ -35,9 +47,11 @@ export class Assistant extends Disposable {
     super()
 
     this.loop = this.createLoop()
+    this.attachments = new AttachmentsContainer(host.attachmentReaders ?? [imageAttachmentReader()])
 
     makeObservable(this)
     bindMethods(this)
+    this.restoreState({})
 
     this.disposer(() => this.abortController?.abort())
     this.disposer(() => this.attachments.dispose())
@@ -78,7 +92,7 @@ export class Assistant extends Disposable {
   }
 
   /** What the user is about to send along. */
-  public readonly attachments = new AttachmentsContainer()
+  public readonly attachments: AttachmentsContainer
 
   @computed
   public get canSend() {
@@ -91,6 +105,7 @@ export class Assistant extends Disposable {
   @computed
   public get canSendCurrent() {
     if (!this.canSend) { return false }
+    if (!this.attachments.ready) { return false }
 
     const hasDraft = this.input.trim() !== ''
     const hasAttachments = this.attachments.count > 0
@@ -175,11 +190,16 @@ export class Assistant extends Disposable {
   @action
   public addBehavior(behavior: AssistantBehavior) {
     this._additionalBehaviors.add(behavior)
+    behavior.restoreState?.(this.state[behavior.name] ?? null)
     return this.removeBehavior.bind(this, behavior)
   }
 
   @action
   public removeBehavior(behavior: AssistantBehavior) {
+    if (!this._additionalBehaviors.has(behavior)) { return }
+
+    // Its state outlives it, like when the user comes back to its part of the app later in the conversation.
+    this.collectState([behavior])
     this._additionalBehaviors.delete(behavior)
   }
 
@@ -212,8 +232,8 @@ export class Assistant extends Disposable {
 
   // #region Actions
 
-  public async send(text: string, attachments: AssistantAttachment[] = []) {
-    return await this.appendAndRun(text, attachments)
+  public async send(text: string, attachments: AssistantAttachment[] = [], options: AssistantSendOptions = {}) {
+    return await this.appendAndRun(text, attachments, options)
   }
 
   public async sendCurrent() {
@@ -311,6 +331,7 @@ export class Assistant extends Disposable {
   private restore(session: AssistantSessionDocument['data']) {
     this.loop.load(toJS(session?.messages ?? []))
     this._entries = session?.entries ?? []
+    this.restoreState(toJS(session?.state ?? {}))
   }
 
   public async archiveSession(id: AssistantSessionID) {
@@ -357,6 +378,42 @@ export class Assistant extends Disposable {
     this._behaviorsAtLastSend = new Set()
     this._entries = []
     this._status = 'idle'
+    this.restoreState({})
+  }
+
+  // #endregion
+
+  // #region Behavior state
+
+  /**
+   * What the behaviors keep for the conversation, by behavior name. Also of behaviors that are not active right now.
+   */
+  private state: AssistantSessionState = {}
+
+  private restoreState(state: AssistantSessionState) {
+    this.state = state
+    for (const behavior of this.behaviorsGeneralFirst) {
+      behavior.restoreState?.(state[behavior.name] ?? null)
+    }
+  }
+
+  private collectState(behaviors: AssistantBehavior[] = this.behaviorsGeneralFirst) {
+    for (const behavior of behaviors) {
+      if (behavior.saveState == null) { continue }
+      this.state[behavior.name] = behavior.saveState()
+    }
+  }
+
+  /** Only stored when there is any, so that apps without behavior state don't need to store it. */
+  private stateContent(): Pick<AssistantSessionContent, 'state'> {
+    this.collectState()
+    if (objectKeys(this.state).length > 0) { 
+      return {
+        state: toJS(this.state),
+      }
+    } else {
+      return {}
+    }
   }
 
   // #endregion
@@ -396,7 +453,8 @@ export class Assistant extends Disposable {
     } else {
       await this._currentSessionDocument.update({
         messages: this.loop.messages,
-        entries:  toJS(this._entries),
+        entries:  storableEntries(this._entries),
+        ...this.stateContent(),
       })
     }
   }
@@ -408,7 +466,8 @@ export class Assistant extends Disposable {
     const id = await this.host.sessions.create({
       title:    userEntries.length > 0 ? truncate(userEntries[0].text, {length: 100}) : null,
       messages: this.loop.messages,
-      entries:  toJS(this._entries),
+      entries:  storableEntries(this._entries),
+      ...this.stateContent(),
     })
     if (conversation !== this.conversation) {
       // A new conversation was started in the mean time.
@@ -433,28 +492,76 @@ export class Assistant extends Disposable {
   private turn: Promise<void> | null = null
   private conversation: number = 0
 
-  private async appendAndRun(text: string, attachments: AssistantAttachment[] = []) {
+  private async appendAndRun(text: string, attachments: AssistantAttachment[] = [], options: AssistantSendOptions = {}) {
     if (!this.canSend) { return }
     runInAction(() => {
       this._behaviorsAtLastSend = new Set(this._additionalBehaviors)
     })
 
-    const images = await Promise.all(attachments.map(it => thumbnailURL(it.file)))
-    this.addEntry({type: 'user', text, images})
+    const {images = [], llmNote} = options
+    const entry = this.addUserEntry(text, attachments, images)
 
     await this.runTurn(async () => {
+      const uploaded = await this.uploadAttachments(entry, attachments)
       const context = this.contextText()
       this.lastContext = context
       this.loop.append({
         role:    'user',
         content: [
           {type: 'text', text: context},
-          ...await this.host.attachmentBlocks(attachments),
+          ...await this.attachmentBlocks(uploaded),
           ...(text === '' ? [] : [{type: 'text' as const, text}]),
+          ...(llmNote == null ? [] : [{type: 'text' as const, text: llmNote}]),
         ],
       })
       this.saveCurrentSession()
     })
+  }
+
+  /** Shows the entry at once, with the previews of its attachments until they have been uploaded. */
+  @action
+  private addUserEntry(text: string, attachments: AssistantAttachment[], images: string[]): AssistantUserEntry {
+    this.addEntry({
+      type:   'user', 
+      text:   text, 
+      images: [...attachmentImages(attachments), ...images],
+    })
+
+    // The observable version of it, which is the one to update.
+    return this._entries[this._entries.length - 1] as AssistantUserEntry
+  }
+
+  /** Uploads the attachments, and has the entry refer to the uploads instead of to their previews. */
+  private async uploadAttachments(entry: AssistantUserEntry, attachments: AssistantAttachment[]): Promise<AssistantUploadedAttachment[]> {
+    if (attachments.length === 0) { return [] }
+
+    let uploads: Array<string | null>
+    try {
+      uploads = await Promise.all(attachments.map(it => this.host.uploadAttachment(it)))
+    } catch (error) {
+      throw new AttachmentsError(error)
+    }
+
+    runInAction(() => {
+      const others = entry.images.slice(attachmentImages(attachments).length)
+      entry.images = [...attachmentImages(attachments, uploads), ...others]
+    })
+    return attachments.map((it, index) => ({...it, image: uploads[index]}))
+  }
+
+  /** What the host sends of the attachments, followed by what the behaviors add, like how they use them. */
+  private async attachmentBlocks(attachments: AssistantUploadedAttachment[]): Promise<LLMContentBlock[]> {
+    if (attachments.length === 0) { return [] }
+
+    try {
+      const blocks = await this.host.attachmentBlocks(attachments)
+      for (const behavior of this.behaviorsGeneralFirst) {
+        blocks.push(...await behavior.attachmentBlocks?.(attachments) ?? [])
+      }
+      return blocks
+    } catch (error) {
+      throw new AttachmentsError(error)
+    }
   }
 
   private async runTurn(prepare?: () => Promise<void>) {
@@ -490,6 +597,11 @@ export class Assistant extends Disposable {
       } else if (error instanceof LLMStreamError) {
         this.addError('provider', error.message)
         this.setStatus('failed')
+      } else if (error instanceof AttachmentsError) {
+        this.logger.error(error.message, error.cause)
+        // The user's message never got into the conversation, so there is nothing to retry.
+        this.addError('attachments', error.message, false)
+        this.setStatus('failed')
       } else {
         console.error(error)
         this.addError('unknown')
@@ -515,6 +627,8 @@ export class Assistant extends Disposable {
       onResponseStart:  () => shown.clear(),
       onText:           (index, type, text) => this.showBlock(shown, index, type === 'text' ? 'assistant' : 'thinking', text),
       checkpoint:       () => this.saveCurrentSession(),
+    }, {
+      maxTurns: this.config.maxTurns,
     })
   }
 
@@ -607,8 +721,8 @@ export class Assistant extends Disposable {
    * The conversation can only be continued after a message of the user's (or tool results): LLMs don't accept one
    * ending in their own message.
    */
-  private addError(code: AssistantErrorCode, message?: string) {
-    this.addEntry({type: 'error', code, message, retryable: this.loop.canContinue})
+  private addError(code: AssistantErrorCode, message?: string, retryable: boolean = this.loop.canContinue) {
+    this.addEntry({type: 'error', code, message, retryable})
   }
 
   // #endregion
@@ -616,14 +730,31 @@ export class Assistant extends Disposable {
 }
 
 /**
- * What the assistant needs from the app: how to reach the LLM, where to store sessions, and how to send attachments.
+ * What the assistant needs from the app: how to reach the LLM, where to store sessions, and how to read and send attachments.
  */
 export interface AssistantHost {
   transport: AgentLoopTransport
   sessions:  AssistantSessions
 
-  /** Builds the blocks that show the attachments to the LLM, like after uploading them. */
-  attachmentBlocks(attachments: AssistantAttachment[]): Promise<LLMContentBlock[]>
+  /** How the files that the user attaches are read, each by the first that matches. By default, PNG and JPEG images. */
+  attachmentReaders?: AnyAssistantAttachmentReader[]
+
+  /**
+   * Uploads an attachment, and resolves to how the app refers to it as an image, like `media:12`. Resolves to `null`
+   * for an attachment that is only kept in memory: the conversation shows its preview until the page is reloaded.
+   */
+  uploadAttachment(attachment: AssistantAttachment): Promise<string | null>
+
+  /** Builds the blocks that show the uploaded attachments to the LLM. */
+  attachmentBlocks(attachments: AssistantUploadedAttachment[]): Promise<LLMContentBlock[]>
+}
+
+export interface AssistantSendOptions {
+  /** Sent to the LLM after the text, but not shown to the user, like the ID of what they chose. */
+  llmNote?: string
+
+  /** Images to show with the user's entry besides its attachments, by how the app refers to them. */
+  images?: string[]
 }
 
 export type AssistantStatus = 'idle' | 'running' | 'failed'
@@ -638,6 +769,33 @@ const coreTools: AssistantTool[] = [
 ]
 
 const maxHints = 4
+
+/**
+ * The images of attachments, by upload where there is one, and by preview otherwise.
+ */
+function attachmentImages(attachments: AssistantAttachment[], uploads: Array<string | null> = []): Array<string | Blob> {
+  return attachments.flatMap((it, index) => {
+    const image = uploads[index] ?? it.preview
+    return image == null ? [] : [image]
+  })
+}
+
+/** Images that are kept in memory are left out. */
+function storableEntries(entries: AssistantEntry[]): AssistantEntry[] {
+  return toJS(entries).map(entry => {
+    if (entry.type !== 'user') { return entry }
+    return {...entry, images: entry.images.filter(it => typeof it === 'string')}
+  })
+}
+
+/** The attachments could not be sent, like when uploading them failed. */
+class AttachmentsError extends Error {
+
+  constructor(cause: unknown) {
+    super(errorMessage(cause), {cause})
+  }
+
+}
 
 /**
  * A tool result can only hold text, so other output, like images, follows the results of the turn, marked with the

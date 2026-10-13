@@ -9,4 +9,7 @@ export interface AssistantConfig {
 
   /** Active throughout. They come first in the prompt, and reveal last. */
   generalBehaviors: AssistantBehavior[]
+
+  /** The most requests to the LLM for one message of the user's, as a safeguard against runaway loops. By default 40. */
+  maxTurns?: number
 }
