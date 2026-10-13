@@ -2,6 +2,7 @@ import Logger from 'logger'
 import { action, computed, makeObservable, observable } from 'mobx'
 import { bindMethods, errorMessage } from 'ytil'
 import { acceptsFile } from './acceptsFile'
+import { attachmentID } from './attachmentID'
 import {
   AnyAssistantAttachmentReader,
   AssistantAttachmentContent,
@@ -58,7 +59,16 @@ export class AttachmentsContainer {
       const reader = this.readers.find(it => it.matches?.(file) ?? acceptsFile(it.accept, file))
       if (reader == null) { continue }
 
-      const attachment = {kind: reader.kind, file, status: 'reading', data: null, preview: null, error: null} as AssistantAttachment
+      const attachment = {
+        id:      attachmentID(),
+        kind:    reader.kind,
+        file,
+        status:  'reading',
+        data:    null,
+        preview: null,
+        url:     localPreviewURL(file),
+        error:   null,
+      } as AssistantAttachment
       this._attachments = [...this._attachments, attachment]
       void this.read(attachment, reader)
     }
@@ -86,7 +96,9 @@ export class AttachmentsContainer {
   private async read(attachment: AssistantAttachment, reader: AnyAssistantAttachmentReader) {
     try {
       const {data, preview}: AssistantAttachmentContent = await reader.read(attachment.file)
-      this.replace(attachment, {...attachment, status: 'ready', data, preview, url: URL.createObjectURL(preview)} as AssistantAttachment)
+      const url = preview === attachment.file && attachment.url != null ? attachment.url : URL.createObjectURL(preview)
+      if (url !== attachment.url) { revoke(attachment) }
+      this.replace(attachment, {...attachment, status: 'ready', data, preview, url} as AssistantAttachment)
     } catch (error) {
       this.logger.error(`Could not read ${attachment.file.name}`, error)
       this.replace(attachment, {...attachment, status: 'failed', error: errorMessage(error)})
@@ -110,6 +122,7 @@ export type AssistantAttachment = {
 }[AssistantAttachmentKind]
 
 export interface AssistantAttachmentOf<K extends AssistantAttachmentKind> {
+  id:     number
   kind:   K
   file:   File
   status: AssistantAttachmentStatus
@@ -117,7 +130,9 @@ export interface AssistantAttachmentOf<K extends AssistantAttachmentKind> {
   /** Once read. */
   data:    AssistantAttachmentKinds[K] | null
   preview: Blob | null
-  url?:    string
+
+  /** The preview, or the file itself while it is being read if the browser can show it. */
+  url?: string
 
   /** Why it could not be read. */
   error: string | null
@@ -127,6 +142,11 @@ export interface AssistantAttachmentOf<K extends AssistantAttachmentKind> {
 export type AssistantUploadedAttachment = AssistantAttachment & {image: string | null}
 
 export type AssistantAttachmentStatus = 'reading' | 'ready' | 'failed'
+
+function localPreviewURL(file: File) {
+  if (!file.type.startsWith('image/') || file.type === 'image/vnd.adobe.photoshop') { return undefined }
+  return URL.createObjectURL(file)
+}
 
 function revoke(attachment: AssistantAttachment) {
   if (attachment.url != null) {

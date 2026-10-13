@@ -20,7 +20,7 @@ describe('AttachmentsContainer', () => {
     await settled()
 
     expect(container.all()).toEqual([
-      {kind: 'image', file: png, status: 'ready', data: null, preview: png, url: expect.any(String), error: null},
+      {id: expect.any(Number), kind: 'image', file: png, status: 'ready', data: null, preview: png, url: expect.any(String), error: null},
     ])
   })
 
@@ -75,6 +75,36 @@ describe('AttachmentsContainer', () => {
     await settled()
 
     expect(container.count).toBe(0)
+  })
+
+  it('shows an image file itself while it is being read', async () => {
+    const read = deferred()
+    const reader: AssistantAttachmentReader<'image'> = {
+      kind:   'image',
+      accept: {'image/png': ['.png']},
+      read:   async file => {
+        await read.promise
+        return {data: null, preview: file}
+      },
+    }
+    const container = new AttachmentsContainer([reader])
+    container.attach([file('logo.png', 'image/png')])
+
+    const {url} = container.all()[0]
+    expect(url).toEqual(expect.any(String))
+
+    read.resolve()
+    await settled()
+
+    expect(container.all()[0]).toMatchObject({status: 'ready', url})
+  })
+
+  it('has no preview of a file the browser cannot show until it has been read', () => {
+    const {reader} = designReader()
+    const container = new AttachmentsContainer([reader])
+    container.attach([file('design.psd', 'image/vnd.adobe.photoshop')])
+
+    expect(container.all()[0].url).toBeUndefined()
   })
 
   it('combines what its readers accept', () => {

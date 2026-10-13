@@ -443,7 +443,7 @@ function behavior(name: string, overrides: Partial<AssistantBehavior> = {}): Ass
 
 function readyImage(name: string): AssistantAttachment {
   const file = new File(['image'], name, {type: 'image/png'})
-  return {kind: 'image', file, status: 'ready', data: null, preview: file, error: null}
+  return {id: 0, kind: 'image', file, status: 'ready', data: null, preview: file, error: null}
 }
 
 function statefulBehavior(name: string) {
