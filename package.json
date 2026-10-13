@@ -22,7 +22,7 @@
     "lodash": "^4.17.21",
     "logger": "workspace:^",
     "react-util": "workspace:^",
-    "ytil": "workspace:^"
+    "ytil": "workspace:*"
   },
   "peerDependencies": {
     "mobx": ">=6.15",
