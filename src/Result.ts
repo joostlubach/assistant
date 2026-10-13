@@ -4,7 +4,7 @@
 export type Result<T = void> = ResultOK<T> | ResultError
 
 export const Result = {
-  ok:    <T = void>(...[data]: [T] extends [void] ? [] : [T]): ResultOK<T> => ({status: 'ok', data: data as T}),
+  ok,
   error: (message: string): ResultError => ({status: 'error', message}),
 }
 
@@ -16,4 +16,10 @@ export interface ResultOK<T> {
 export interface ResultError {
   status:  'error'
   message: string
+}
+
+function ok(): ResultOK<void>
+function ok<T>(data: T): ResultOK<T>
+function ok(data?: unknown): ResultOK<unknown> {
+  return {status: 'ok', data}
 }
